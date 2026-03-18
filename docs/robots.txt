@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://github.devleader.ca/google-psi-mcp/sitemap.xml
