@@ -1,8 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express, { Request, Response } from "express";
+import express, { Request, Response, NextFunction } from "express";
 import { z } from "zod";
+import crypto from "crypto";
 
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
 const API_KEY = process.env.GOOGLE_PSI_API_KEY;
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -12,6 +16,69 @@ if (!API_KEY) {
   process.exit(1);
 }
 
+if (!MCP_AUTH_TOKEN) {
+  console.warn(
+    "WARNING: MCP_AUTH_TOKEN env var is not set. " +
+    "All MCP requests will be rejected with 500 until you set it in Railway."
+  );
+} else {
+  console.log(
+    `MCP_AUTH_TOKEN loaded (prefix=${MCP_AUTH_TOKEN.slice(0, 6)}..., length=${MCP_AUTH_TOKEN.length})`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Token extraction — supports both methods, query param is primary for Claude
+// ---------------------------------------------------------------------------
+function extractToken(req: Request): { token: string | null; source: string } {
+  // 1. Check Authorization: Bearer header (for non-Claude clients like curl)
+  const authHeader = req.headers["authorization"];
+  if (authHeader) {
+    const parts = authHeader.split(/\s+/, 2);
+    if (parts.length === 2 && parts[0].toLowerCase() === "bearer") {
+      return { token: parts[1], source: "header" };
+    }
+    return { token: authHeader.trim(), source: "header_malformed" };
+  }
+
+  // 2. Fall back to ?token= query parameter (Claude connector method)
+  const queryToken = req.query.token;
+  if (typeof queryToken === "string" && queryToken) {
+    return { token: queryToken, source: "query" };
+  }
+
+  return { token: null, source: "none" };
+}
+
+// ---------------------------------------------------------------------------
+// Constant-time token comparison
+// ---------------------------------------------------------------------------
+function tokenMatches(provided: string, expected: string): boolean {
+  // Hash both so buffers are always equal length, preventing length leakage
+  const a = crypto.createHash("sha256").update(provided).digest();
+  const b = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+// ---------------------------------------------------------------------------
+// Accept header normalization
+// ---------------------------------------------------------------------------
+// The MCP streamable-HTTP spec requires Accept to include both
+// 'application/json' and 'text/event-stream'. Claude's connector sends
+// 'Accept: */*' on its initial probe, which the SDK rejects with 406.
+// Rewrite it before the MCP handler sees it.
+function normalizeAcceptHeader(req: Request): boolean {
+  const accept = req.headers["accept"] || "";
+  if (accept.includes("application/json") && accept.includes("text/event-stream")) {
+    return false; // already compliant
+  }
+  req.headers["accept"] = "application/json, text/event-stream";
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// PSI helpers
+// ---------------------------------------------------------------------------
 const PSI_BASE = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed";
 const CATEGORIES = ["performance", "seo", "accessibility", "best-practices"];
 
@@ -175,6 +242,9 @@ async function runPSI(url: string, strategy: string): Promise<PSIResult> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// MCP server factory
+// ---------------------------------------------------------------------------
 function createServer(): McpServer {
   const server = new McpServer({
     name: "google-psi-mcp",
@@ -217,24 +287,91 @@ function createServer(): McpServer {
   return server;
 }
 
+// ---------------------------------------------------------------------------
+// Express app with auth middleware
+// ---------------------------------------------------------------------------
 async function main() {
   const app = express();
   app.use(express.json());
 
+  // --- Public endpoints (no auth) — Railway healthcheck needs these -------
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ status: "ok" });
+    res.json({ status: "ok", token_configured: !!MCP_AUTH_TOKEN });
   });
 
-  app.all("/mcp", async (req: Request, res: Response) => {
-    if (MCP_AUTH_TOKEN) {
-      const auth = req.headers["authorization"];
-      const token = auth?.startsWith("Bearer ") ? auth.slice(7) : null;
-      if (token !== MCP_AUTH_TOKEN) {
-        res.status(401).json({ error: "Unauthorized" });
-        return;
+  app.get("/", (_req: Request, res: Response) => {
+    res.json({
+      service: "google-psi-mcp",
+      status: "ok",
+      mcp_endpoint: "/mcp",
+      auth_methods: [
+        "Authorization: Bearer <token>  header",
+        "?token=<token>                  query param",
+      ],
+      token_configured: !!MCP_AUTH_TOKEN,
+    });
+  });
+
+  // --- Auth middleware for /mcp paths -------------------------------------
+  const mcpAuthMiddleware = (req: Request, res: Response, next: NextFunction): void => {
+    console.log("=".repeat(70));
+    console.log(`Incoming request: ${req.method} ${req.path}`);
+    console.log(`Query string: ${req.url.includes("?") ? req.url.split("?")[1] : "<empty>"}`);
+
+    // Log headers (mask sensitive ones)
+    console.log("Headers received:");
+    for (const [k, v] of Object.entries(req.headers)) {
+      if (k.toLowerCase() === "authorization") {
+        const val = String(v);
+        console.log(`  ${k}: ${val.slice(0, 20)}...`);
+      } else if (k.toLowerCase() === "cookie") {
+        console.log(`  ${k}: <redacted>`);
+      } else {
+        console.log(`  ${k}: ${v}`);
       }
     }
 
+    // Server misconfigured guard
+    if (!MCP_AUTH_TOKEN) {
+      console.error("Rejecting request: MCP_AUTH_TOKEN is not set on the server");
+      res.status(500).json({ error: "server_misconfigured", detail: "MCP_AUTH_TOKEN not set" });
+      return;
+    }
+
+    const { token, source } = extractToken(req);
+    console.log(`Token extraction: source=${source}, token_present=${token !== null}`);
+
+    if (!token) {
+      console.warn("No token provided — returning 401");
+      res.status(401).json({ error: "unauthorized", detail: "missing token" });
+      return;
+    }
+
+    if (source === "header_malformed") {
+      console.warn("Authorization header present but not in 'Bearer X' form — returning 401");
+      res.status(401).json({ error: "unauthorized", detail: "malformed Authorization header" });
+      return;
+    }
+
+    // Constant-time comparison
+    if (!tokenMatches(token, MCP_AUTH_TOKEN)) {
+      console.warn(`Token mismatch (source=${source}, received_prefix=${token.slice(0, 6)}...) — returning 401`);
+      res.status(401).json({ error: "unauthorized", detail: "invalid token" });
+      return;
+    }
+
+    console.log(`Auth OK via ${source} — forwarding to handler`);
+
+    // Normalize Accept header for MCP SDK compliance
+    if (normalizeAcceptHeader(req)) {
+      console.log("Rewrote Accept header to satisfy MCP streamable-HTTP spec");
+    }
+
+    next();
+  };
+
+  // --- MCP handler (behind auth) ------------------------------------------
+  const mcpHandler = async (req: Request, res: Response) => {
     const server = createServer();
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
@@ -249,7 +386,11 @@ async function main() {
       console.error("MCP request error:", err);
       if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
     }
-  });
+  };
+
+  // Handle both /mcp and /mcp/ — Claude's connector sends the trailing slash
+  app.all("/mcp", mcpAuthMiddleware, mcpHandler);
+  app.all("/mcp/", mcpAuthMiddleware, mcpHandler);
 
   app.listen(PORT, () => {
     console.log(`google-psi-mcp listening on port ${PORT}`);
